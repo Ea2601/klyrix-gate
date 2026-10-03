@@ -279,3 +279,8 @@
    Yalnız zemin değişir (durum kartlarıyla aynı ton); kod kutusu ve süre çubuğu değişkenden. */
 :root.light-theme .flt-claim,
 :root.light-theme .flt-suggest-text { background: rgba(15, 23, 42, 0.025); }
+
+/* ── 16. Ağ Ajandası ızgarası (Ay / Hafta, AgendaGrid.css — G5.5; 12. bölüm Takvim kuralları — G5.3) ──
+   Tembel sekme CSS'i bu katmandan sonra yüklenir: .agg'deki token bloğunu eşit özgüllük ezer, tam :root.light-theme gerekir.
+   Kaynak renkleri 8. bölümden (.ag-panel); burada yalnız "onay bekliyor" rengi (açık zeminde koyu amber, 12. bölümle aynı). */
+:root.light-theme .agg { --agenda-pending: 146, 64, 14; }

@@ -160,3 +160,15 @@
     grid-template-areas: 'title every note tag go';
   }
 }
+
+/* Görünüm seçici (G5.5: Ay / Hafta / Liste — panel başlığında). Yüksekliği Yenile düğmesininki kadar (31 px): başlık büyümez,
+   Liste görünümü G5.1'deki yerinde kalır. Dar ekranda yalnız simge (metin ekran okuyucuya kalır) — başlık satırı sarmaz. */
+.ag-views .ag-seg-btn { display: inline-flex; align-items: center; gap: 5px; min-height: 25px; padding: 0 9px; font-size: 12px; }
+.ag-views .ag-seg-btn svg { flex-shrink: 0; }
+@media (max-width: 640px) {
+  .ag-views { gap: 2px; }
+  .ag-views .ag-seg-btn { min-width: 24px; padding: 0 5px; justify-content: center; }
+  .ag-views-t {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+}

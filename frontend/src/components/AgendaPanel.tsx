@@ -1,31 +1,52 @@
-import { lazy, Suspense, useCallback, useMemo, useState } from 'react';
-import type { MouseEvent } from 'react';
-import { CalendarDays, AlertTriangle, Info, ChevronRight, Repeat, RefreshCw, Loader2, X, CalendarSync } from 'lucide-react';
+import { Component, lazy, Suspense, useCallback, useMemo, useState } from 'react';
+import type { MouseEvent, ReactNode } from 'react';
+import { CalendarDays, AlertTriangle, Info, ChevronRight, Repeat, RefreshCw, Loader2, X, CalendarSync, Calendar, Columns3, List } from 'lucide-react';
 import { useApi } from '../hooks/useApi';
 import { Panel } from './ui';
 import { parseDbTime } from '../time';
-import { BANDWIDTH_TAB_KEY, MAINTENANCE_TAB_KEY } from '../nav';
-import type { TabId } from '../types';
 import { CalendarSources } from './CalendarSources';
+import { TAG, SUB_KEYS, emitCalendarChanged } from './agendaShared';
+import type { Source, AgendaLink, AgendaItem } from './agendaShared';
 import './AgendaPanel.css';
 
 // Takvim kuralları (G5.3): ayrı parça — yalnız bu sayfa açılınca yüklenir
 const CalendarRules = lazy(() => import('./CalendarRules').then(m => ({ default: m.CalendarRules })));
+// Ay / Hafta ızgarası (G5.5): ayrı parça — yalnız o görünüm seçilince yüklenir. Güncellemeden sonra açık kalmış sekmede eski
+// adlı parça yoktur: App.tsx lazyTab'daki gibi sayfa bir kez kendiliğinden yenilenir; yine yüklenemezse GridGuard yalnız
+// ızgaranın yerine bant gösterir — Liste görünümü, Takvim bağlantıları ve kuralları çalışmaya devam eder. Bayrak ızgaraya
+// özgü: lazyTab'ın 'klx-chunk-reload'u bu sayfanın parçası her yüklendiğinde silinir — ortak anahtar yenileme döngüsü olurdu.
+const GRID_RELOAD_KEY = 'klx-grid-reload';
+const AgendaGrid = lazy(() => import('./AgendaGrid').then(m => {
+  try { sessionStorage.removeItem(GRID_RELOAD_KEY); } catch { /* depolama yok */ }
+  return { default: m.AgendaGrid };
+}, () => {
+  let first = false;
+  try { first = !sessionStorage.getItem(GRID_RELOAD_KEY); if (first) sessionStorage.setItem(GRID_RELOAD_KEY, '1'); } catch { first = false; }
+  if (first) { window.location.reload(); return new Promise<never>(() => {}); }
+  throw new Error('parça yüklenemedi — sayfayı yenileyin (panel güncellenmiş olabilir)');
+}));
+// Izgaranın hata sınırı: yüklenemeyen parça ya da çizim hatası sekmenin tamamını düşürmez
+class GridGuard extends Component<{ children: ReactNode; onList: () => void }, { err: string | null }> {
+  state: { err: string | null } = { err: null };
+  static getDerivedStateFromError(e: unknown) { return { err: e instanceof Error ? e.message : String(e) }; }
+  componentDidCatch(e: unknown) { console.error('Ağ Ajandası ızgarası:', e); }
+  render() {
+    if (this.state.err === null) return this.props.children;
+    return (
+      <div className="ag-alert is-error" role="alert"><AlertTriangle size={14} />
+        <span>Izgara gösterilemedi: {this.state.err}{' '}
+          <button className="ag-clear" onClick={this.props.onList}><List size={12} /> Liste görünümüne geç</button></span>
+      </div>
+    );
+  }
+}
 
 // Ağ Ajandası (backend agenda.ts, GET /api/agenda): Pi'de zamanlanmış işler ve saat pencereleri — salt okunur. Ebeveyn ve
 // Trafik Zamanlayıcı pencereleri, panel ve sistem cron görevleri, bulut yedeği, otomatik hız testi, kota dönemi ve Zapret
 // gece denetimi gün gün listelenir; eşleşen günde 24'ten çok ya da 5 dakikadan sık tekrar eden işler "Periyodik işler"
 // özetindedir. Saatler Pi'nin saat dilimiyle gösterilir (tarayıcınınki farklı olsa da). Bağlı dış takvimlerin (Google /
 // Outlook / iCloud, CalendarSources) etkinlikleri de "Takvim" kaynağı olarak, etiketleriyle listelenir.
-type Source = 'parental' | 'traffic' | 'cron' | 'system' | 'vault' | 'speedtest' | 'quota' | 'zapret' | 'calendar';
-// sub: sayfanın açılacak alt sekmesi (tek seferlik oturum anahtarıyla)
-interface AgendaLink { tab: TabId; sub?: string }
-interface AgendaItem {
-  id: string; source: Source; title: string; start: string; end: string | null; kind: 'window' | 'job' | 'reset';
-  approx: boolean; link: AgendaLink | null; note?: string; since?: boolean;
-  // Yalnız dış takvim öğelerinde: etiketler, takvimin adı / rengi, tüm gün, çözülemedi nedeni (tz | rrule | limit | time)
-  tags?: string[]; calendar?: string; color?: string; allDay?: boolean; unresolved?: string;
-}
+// Görünümler (G5.5): Liste (varsayılan, aşağıdaki), Hafta ve Ay ızgarası (AgendaGrid.tsx) — seçim bu tarayıcıda hatırlanır.
 interface PeriodicJob {
   id: string; source: Source | 'panel'; kind: 'periodic'; title: string; everySec: number | null; next: string | null;
   note?: string; link: AgendaLink | null; atBoot?: boolean; dead?: boolean;
@@ -40,13 +61,14 @@ const EMPTY: AgendaResp = {
 };
 
 const RANGES = [{ days: 7, label: '7 gün' }, { days: 14, label: '14 gün' }, { days: 31, label: '31 gün' }];
-// Kaynağın kısa etiketi (renk: AgendaPanel.css --agenda-<kaynak>)
-const TAG: Record<Source | 'panel', string> = {
-  parental: 'Ebeveyn', traffic: 'Trafik', cron: 'Cron', system: 'Sistem', vault: 'Bulut yedeği', speedtest: 'Hız testi',
-  quota: 'Kota', zapret: 'Zapret', calendar: 'Takvim', panel: 'Panel',
+type View = 'month' | 'week' | 'list';
+const VIEWS: { id: View; label: string; Icon: typeof List }[] = [
+  { id: 'month', label: 'Ay', Icon: Calendar }, { id: 'week', label: 'Hafta', Icon: Columns3 }, { id: 'list', label: 'Liste', Icon: List },
+];
+const VIEW_KEY = 'klx-agenda-view';
+const readView = (): View => {
+  try { const v = localStorage.getItem(VIEW_KEY); return v === 'month' || v === 'week' ? v : 'list'; } catch { return 'list'; }
 };
-// Alt sekmeyi açan tek seferlik anahtarlar (BandwidthPanel / SystemLogs açılışta okuyup siler)
-const SUB_KEYS: Partial<Record<TabId, string>> = { bandwidth: BANDWIDTH_TAB_KEY, maintenance: MAINTENANCE_TAB_KEY };
 
 // Pi'nin saat dilimiyle biçimleyiciler; dilim tarayıcıda tanınmazsa tarayıcının saati
 function formatters(tz: string) {
@@ -86,9 +108,14 @@ export function AgendaPanel() {
   const [days, setDays] = useState(7);
   const [only, setOnly] = useState<Source | ''>('');
   const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<View>(readView);
+  const pickView = (v: View) => {
+    setMode(v);
+    try { localStorage.setItem(VIEW_KEY, v); } catch { /* depolama yok: yalnız bu açılışta geçerli */ }
+  };
   const { data, loading, error, refetch } = useApi<AgendaResp>(`/agenda?days=${days}`, EMPTY, 60000);
-  // Takvim bağlantısı eklenince / eşitlenince ajanda yenilenir
-  const calendarChanged = useCallback(() => { void refetch(); }, [refetch]);
+  // Takvim bağlantısı eklenince / eşitlenince ajanda (ve açıksa ızgara) yenilenir
+  const calendarChanged = useCallback(() => { void refetch(); emitCalendarChanged('sources'); }, [refetch]);
   // Aralık değişirken (useApi veriyi boşaltır) yeni yanıt gelene dek önceki yanıt soluk gösterilir (önceki render'ın
   // verisi durumda tutulur — React'in "önceki değeri saklama" kalıbı)
   const [last, setLast] = useState<AgendaResp>(EMPTY);
@@ -152,18 +179,36 @@ export function AgendaPanel() {
   };
   const refresh = async () => {
     setBusy(true);
+    if (mode !== 'list') emitCalendarChanged('refresh');
     try { await refetch(); } finally { setBusy(false); }
   };
 
   return (
     <>
     <Panel title="Ağ Ajandası" icon={<CalendarDays size={20} style={{ marginRight: 8 }} />} className="ag-panel"
-      subtitle="Pi'de zamanlanmış işler ve saat pencereleri — salt okunur; değiştirmek için ilgili sayfayı açın"
-      actions={
+      subtitle={mode === 'list' ? "Pi'de zamanlanmış işler ve saat pencereleri — salt okunur; değiştirmek için ilgili sayfayı açın"
+        : mode === 'week' ? "Pi'de zamanlanmış işler ve saat pencereleri. Boş saatlere sürükleyerek (ya da «Aralık ekle» ile) o aralığa takvim profili bağlayın; kilitli öğeler kendi sayfalarından değişir"
+          : "Pi'de zamanlanmış işler ve takvim etkinlikleri gün gün. Bir güne tıklayıp Hafta'da boş saatlere sürükleyin ya da «Aralık ekle» ile aralığa takvim profili bağlayın; kilitli öğeler kendi sayfalarından değişir"}
+      actions={<>
+        {/* Başlık yüksekliği Yenile düğmesininkini aşmaz (Liste görünümü G5.1 ile aynı yerde kalır); dar ekranda yalnız simge */}
+        <div className="ag-seg ag-views" role="group" aria-label="Görünüm">
+          {VIEWS.map(({ id, label, Icon }) => (
+            <button key={id} className={`ag-seg-btn${mode === id ? ' is-on' : ''}`} aria-pressed={mode === id} title={`${label} görünümü`} onClick={() => pickView(id)}>
+              <Icon size={13} aria-hidden="true" /><span className="ag-views-t">{label}</span>
+            </button>
+          ))}
+        </div>
         <button className="btn-outline btn-sm" onClick={() => void refresh()} disabled={loading || busy} aria-label="Yenile">
           {loading || busy ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Yenile
         </button>
-      }>
+      </>}>
+      {mode !== 'list' ? (
+        <GridGuard onList={() => pickView('list')}>
+          <Suspense fallback={<p className="ag-empty ag-loading"><Loader2 size={14} className="spin" /> Izgara yükleniyor…</p>}>
+            <AgendaGrid view={mode} tz={view.tz} processTz={view.processTz} tzMismatch={view.tzMismatch} now={now} error={error} onView={pickView} />
+          </Suspense>
+        </GridGuard>
+      ) : <>
       <div className="ag-toolbar">
         <div className="ag-seg" role="group" aria-label="Aralık">
           {RANGES.map(r => (
@@ -257,6 +302,7 @@ export function AgendaPanel() {
         ))}
       </div>
       {view.truncated && <p className="ag-empty">Liste uzun olduğu için kısaltıldı — daha kısa bir aralık seçin.</p>}
+      </>}
 
       {(scheduled.length > 0 || internal.length > 0) && (
         <details className="ag-periodic" open={unknown || undefined}>

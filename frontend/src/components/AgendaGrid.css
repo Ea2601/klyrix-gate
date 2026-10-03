@@ -1,0 +1,222 @@
+/* Ağ Ajandası ızgarası (AgendaGrid.tsx, G5.5 — Ay / Hafta görünümü). .ag-panel içinde çizilir: kaynak renkleri AgendaPanel.css
+   --agenda-* (r, g, b) ve [data-src] → --src; açık tema karşılıkları light-theme.css sonunda. Düğme rengi = ne yaptığı:
+   Kaydet / Aralık ekle yeşil, Sil kırmızı, Vazgeç nötr (CalendarRules.css cr-on / cr-off deseni; DHCP'nin .btn-on / .btn-off'u
+   genelleştirilmez). */
+.agg {
+  --agenda-pending: 251, 191, 36;
+  --agg-hour: 44px;
+  --agg-gutter: 44px;
+}
+.agg [data-src="local"] { --src: var(--agenda-calendar); }
+.btn-primary.agg-on { background: color-mix(in srgb, var(--success-color) 65%, #000); color: #fff; }
+.btn-primary.agg-on:hover:not(:disabled) { background: color-mix(in srgb, var(--success-color) 70%, #000); box-shadow: 0 4px 12px var(--success-glow); }
+.btn-outline.agg-off {
+  border-color: var(--danger-color); background: color-mix(in srgb, var(--danger-color) 8%, transparent);
+  color: color-mix(in srgb, var(--danger-color) 75%, var(--text-primary));
+}
+.btn-outline.agg-off:hover:not(:disabled) { border-color: var(--danger-color); background: color-mix(in srgb, var(--danger-color) 16%, transparent); }
+.btn-outline.agg-off:disabled, .btn-primary.agg-on:disabled { opacity: 0.45; cursor: not-allowed; }
+.agg .btn-sm, .agg-dialog .btn-sm { display: inline-flex; align-items: center; gap: 5px; }
+
+/* Üst satır: gezinme, başlık, saat dilimi, Aralık ekle */
+.agg-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
+.agg-nav { display: inline-flex; gap: 3px; padding: 3px; border-radius: var(--radius-sm); background: var(--input-bg-soft); }
+.agg-navbtn, .agg-today {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 32px; min-height: 32px; padding: 0 8px; border: 0;
+  border-radius: 6px; background: transparent; color: var(--text-secondary); font-size: 13px; font-family: inherit; cursor: pointer;
+}
+.agg-navbtn:hover:not(:disabled), .agg-today:hover:not(:disabled) { background: var(--bg-surface); color: var(--text-primary); }
+.agg-navbtn:disabled, .agg-today:disabled { opacity: 0.4; cursor: default; }
+.agg-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.agg-add { margin-left: auto; }
+.agg-linkbtn {
+  padding: 0; border: 0; background: none; color: var(--accent-color); font: inherit; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px;
+}
+
+/* Gösterge = kaynak süzgeci (basılı: görünür) */
+.agg-legend { align-items: center; }
+.agg-key.is-hidden { background: transparent; border-style: dashed; opacity: 0.6; }
+.agg-key.is-hidden .agg-swatch { background: transparent; box-shadow: inset 0 0 0 1.5px rgb(var(--src)); }
+.agg-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: rgb(var(--src)); flex-shrink: 0; }
+.agg-swatch.is-pending { background: transparent; border: 1.5px dashed rgb(var(--agenda-pending)); }
+.agg-swatch.is-ext { background: rgba(var(--src), 0.35); box-shadow: inset 0 0 0 1.5px rgb(var(--src)); }   /* dış takvim: açık dolgu */
+.agg-key-note { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-secondary); }
+
+/* Kilitli öğenin ayrıntısı */
+.agg-info {
+  position: relative; margin: 0 0 10px; padding: 10px 44px 10px 12px; border-radius: var(--radius-sm); font-size: 13px;
+  border: 1px solid rgba(var(--src), 0.4); border-left: 4px solid rgb(var(--src)); background: var(--input-bg-soft); color: var(--text-primary);
+}
+.agg-info-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; overflow-wrap: anywhere; }
+.agg-info-h .ag-tag { justify-self: auto; }
+.agg-info-h .ag-badge { margin-left: 0; }
+.agg-info-x { position: absolute; top: 6px; right: 6px; }
+.agg-info-w { margin-top: 4px; font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.agg-info-n { margin-top: 4px; font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.agg-info-n .ag-ctag { margin-left: 0; margin-right: 4px; }
+.agg-info-a { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 8px; font-size: 12px; }
+.agg-lock { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); }
+
+/* ── Hafta ── */
+.agg-week, .agg-month { border: 1px solid var(--panel-border); border-radius: var(--radius-sm); overflow: hidden; background: var(--surface-faint); }
+.agg-week.is-stale, .agg-month.is-stale { opacity: 0.55; }
+.agg-head, .agg-allday { display: grid; grid-template-columns: var(--agg-gutter) repeat(7, minmax(0, 1fr)); border-bottom: 1px solid var(--panel-border); }
+.agg-corner { display: flex; align-items: center; justify-content: center; font-size: 10px; color: var(--text-muted); text-align: center; }
+.agg-dh {
+  min-width: 0; padding: 6px 2px; overflow: hidden; border-left: 1px solid var(--line-soft); font-size: 12px; text-align: center;
+  white-space: nowrap; color: var(--text-secondary); text-transform: capitalize;
+}
+.agg-dh b { display: inline-block; min-width: 22px; padding: 0 4px; border-radius: 999px; color: var(--text-primary); font-weight: 600; }
+.agg-dh.is-today b { background: var(--accent-color); color: var(--accent-contrast); }
+.agg-adcol { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 3px 2px; border-left: 1px solid var(--line-soft); }
+.agg-body {
+  position: relative; display: grid; grid-template-columns: var(--agg-gutter) minmax(0, 1fr);
+  max-height: min(62vh, 620px); overflow-y: auto; overscroll-behavior: contain;
+}
+.agg-gutter { position: relative; height: calc(var(--agg-hour) * 24); }
+.agg-gutter span {
+  position: absolute; right: 6px; transform: translateY(-50%); font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums;
+}
+.agg-cols {
+  position: relative; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); height: calc(var(--agg-hour) * 24);
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.agg-col { position: relative; display: grid; grid-template-rows: repeat(24, minmax(0, 1fr)); min-width: 0; border-left: 1px solid var(--line-soft); }
+.agg-col.is-today { background: color-mix(in srgb, var(--accent-color) 6%, transparent); }
+/* Saat hücresi (klavye hedefi; fare / dokunma sürüklemesi sütunda): saat çizgisi üstte, yarım saat ortada */
+.agg-cell {
+  display: block; min-height: 0; margin: 0; padding: 0; border: 0; border-top: 1px solid var(--line-soft); cursor: cell;
+  background: linear-gradient(var(--surface-soft), var(--surface-soft)) 0 50% / 100% 1px no-repeat;
+}
+.agg-cell:first-child { border-top-color: transparent; }
+.agg-cell:hover:not(:disabled) { background-color: var(--surface-soft); }
+.agg-cell:focus-visible { position: relative; z-index: 5; outline: 2px solid var(--accent-color); outline-offset: -2px; }
+.agg-cell:disabled { cursor: not-allowed; }
+/* Yaz saati: yok olan (ileri alınan) saat taralı, iki kez yaşanan saat hafif amber */
+.agg-dst { position: absolute; left: 0; right: 0; z-index: 1; display: flex; justify-content: flex-end; overflow: hidden; pointer-events: none; }
+.agg-dst.is-gap { background: repeating-linear-gradient(135deg, var(--surface-code) 0 5px, transparent 5px 10px); }
+.agg-dst.is-twice { background: color-mix(in srgb, var(--warning-color) 9%, transparent); }
+.agg-dst span { padding: 1px 3px; font-size: 9px; color: var(--text-secondary); white-space: nowrap; }
+
+/* Öğe blokları: kilitli (soluk, kilit işareti), yerel (dolu, kalın, sürüklenir), onay bekleyen (kesikli amber), etkin (halka) */
+.agg-blk {
+  position: absolute; z-index: 2; display: flex; flex-direction: column; gap: 1px; min-height: 14px; margin: 0; padding: 2px 4px;
+  overflow: hidden; border: 1px solid rgba(var(--src), 0.55); border-left: 3px solid rgb(var(--src)); border-radius: 5px;
+  background: color-mix(in srgb, rgb(var(--src)) 14%, var(--bg-surface)); color: var(--text-primary); font: inherit; font-size: 11px;
+  line-height: 1.25; text-align: left; cursor: pointer;
+}
+.agg-blk.is-local { background: color-mix(in srgb, rgb(var(--src)) 30%, var(--bg-surface)); font-weight: 600; cursor: grab; }
+.agg-blk.is-point { justify-content: center; min-height: 16px; padding: 0 5px; border-radius: 999px; }
+.agg-blk.is-pending { border: 1.5px dashed rgb(var(--agenda-pending)); border-left: 3px solid rgb(var(--agenda-pending)); }
+.agg-blk.is-active { box-shadow: 0 0 0 2px rgba(var(--src), 0.6); }
+.agg-blk.cont-top { border-top-style: dashed; border-top-left-radius: 0; border-top-right-radius: 0; }
+.agg-blk.cont-bot { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.agg-blk:hover { z-index: 3; }
+.agg-blk:focus-visible { z-index: 5; outline: 2px solid var(--accent-color); outline-offset: 1px; }
+.agg-blk-t { display: flex; align-items: center; gap: 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.agg-blk-t svg { flex-shrink: 0; opacity: 0.7; }
+.agg-blk-w { font-size: 10px; font-weight: 400; color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.agg-blk .ag-cdot, .agg-chip .ag-cdot { width: 7px; height: 7px; margin-right: 3px; flex-shrink: 0; }
+.agg-handle { position: absolute; left: 0; right: 0; bottom: 0; height: 9px; cursor: ns-resize; }
+.agg-handle::after {
+  content: ''; position: absolute; left: 50%; bottom: 2px; width: 18px; height: 3px; margin-left: -9px; border-radius: 2px;
+  background: rgb(var(--src));
+}
+.agg-now { position: absolute; left: 0; right: 0; z-index: 3; height: 0; border-top: 2px solid var(--danger-color); pointer-events: none; }
+.agg-now::before { content: ''; position: absolute; left: -4px; top: -5px; width: 8px; height: 8px; border-radius: 50%; background: var(--danger-color); }
+/* Süren seçim ve taşıma / boyutlandırma gölgesi */
+.agg-sel, .agg-ghost {
+  position: absolute; z-index: 4; padding: 2px; overflow: hidden; border-radius: 5px; font-size: 11px; pointer-events: none;
+}
+.agg-sel { border: 2px solid var(--accent-color); background: color-mix(in srgb, var(--accent-color) 22%, transparent); }
+.agg-ghost { border: 2px dashed rgb(var(--agenda-calendar)); background: color-mix(in srgb, rgb(var(--agenda-calendar)) 28%, transparent); }
+.agg-sel span, .agg-ghost span {
+  display: block; width: max-content; max-width: 100%; padding: 1px 4px; border-radius: 4px; background: var(--bg-surface);
+  color: var(--text-primary); font-weight: 600; line-height: 1.3;
+}
+
+/* ── Ay ── */
+.agg-daily { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0; padding: 7px 10px; border-bottom: 1px solid var(--panel-border); font-size: 12px; color: var(--text-primary); }
+.agg-daily-i { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
+.agg-mhead, .agg-mgrid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.agg-mhead { border-bottom: 1px solid var(--panel-border); }
+.agg-mhead span { padding: 6px 2px; font-size: 12px; text-align: center; color: var(--text-secondary); text-transform: capitalize; }
+.agg-mgrid { grid-auto-rows: minmax(98px, auto); }
+.agg-mcell {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 3px; border-top: 1px solid var(--line-soft);
+  border-left: 1px solid var(--line-soft);
+}
+.agg-mcell:nth-child(7n + 1) { border-left: 0; }
+.agg-mcell:nth-child(-n + 7) { border-top: 0; }
+.agg-mcell.is-other { background: var(--surface-sunken); }
+.agg-mcell.is-other .agg-mday { color: var(--text-muted); }
+.agg-mday {
+  align-self: flex-start; min-width: 24px; height: 24px; padding: 0 6px; border: 0; border-radius: 999px; background: transparent;
+  color: var(--text-primary); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.agg-mday:hover { background: var(--accent-glow); }
+.agg-mcell.is-today .agg-mday { background: var(--accent-color); color: var(--accent-contrast); }
+.agg-chip {
+  display: block; width: 100%; min-width: 0; margin: 0; padding: 1px 5px; overflow: hidden; border: 1px solid rgba(var(--src), 0.4);
+  border-left: 3px solid rgb(var(--src)); border-radius: 4px; background: color-mix(in srgb, rgb(var(--src)) 14%, var(--bg-surface));
+  color: var(--text-primary); font: inherit; font-size: 11px; line-height: 1.35; text-align: left; white-space: nowrap; text-overflow: ellipsis;
+  cursor: pointer;
+}
+.agg-chip.is-local { background: color-mix(in srgb, rgb(var(--src)) 28%, var(--bg-surface)); font-weight: 600; }
+.agg-chip.is-pending { border: 1px dashed rgb(var(--agenda-pending)); border-left: 3px solid rgb(var(--agenda-pending)); }
+.agg-chip.is-active { box-shadow: inset 0 0 0 1px rgba(var(--src), 0.7); }
+.agg-chip-t { font-weight: 400; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+/* Yerel / onay bekleyen çipin daha koyu karışık zemininde ikincil metin okunmaz (koyu temada 4.5:1'in altı): saat birincil renkte */
+.agg-chip.is-local .agg-chip-t, .agg-chip.is-pending .agg-chip-t { color: var(--text-primary); }
+.agg-chip .ag-cdot { display: inline-block; vertical-align: 1px; }
+.agg-more {
+  align-self: flex-start; padding: 1px 6px; border: 0; border-radius: 4px; background: transparent; color: var(--accent-color);
+  font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.agg-more:hover { background: var(--accent-glow); }
+.agg-mday:focus-visible, .agg-chip:focus-visible, .agg-more:focus-visible, .agg-navbtn:focus-visible, .agg-today:focus-visible {
+  outline: 2px solid var(--accent-color); outline-offset: 1px;
+}
+
+/* ── Pencere: Profil bağla / panel etkinliği ── */
+.agg-dialog { max-width: 620px; }
+.agg-form { display: flex; flex-direction: column; gap: 10px; }
+.agg-form .ag-alert { margin: 0; }
+.agg-summary {
+  margin: 0; padding: 8px 10px; border: 1px solid var(--panel-border); border-radius: var(--radius-sm); background: var(--surface-soft);
+  color: var(--text-primary); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere;
+}
+.agg-summary svg { vertical-align: -2px; color: var(--accent-color); }
+.agg-fgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+.agg-fgrid label { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; color: var(--text-secondary); }
+.agg-fgrid .config-input { width: 100%; min-width: 0; }
+.agg-wide { grid-column: 1 / -1; }
+.agg-checks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
+.agg-checks > label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-primary); }
+.agg-until .config-input { min-width: 0; max-width: 170px; }
+.agg-muted { margin: 0; font-size: 12px; line-height: 1.5; color: var(--text-secondary); overflow-wrap: anywhere; }
+.agg-actions { flex-wrap: wrap; }
+.agg-actions .agg-del { margin-right: auto; }
+
+@media (max-width: 640px) {
+  .agg { --agg-hour: 40px; --agg-gutter: 32px; }
+  .agg-dh { display: flex; flex-direction: column; align-items: center; gap: 1px; font-size: 10px; }
+  .agg-gutter span { right: 3px; font-size: 9px; }
+  .agg-blk { padding: 1px 2px; font-size: 10px; }
+  .agg-blk-w, .agg-blk-t svg { display: none; }
+  .agg-mgrid { grid-auto-rows: minmax(70px, auto); }
+  .agg-mhead span { font-size: 10px; }
+  .agg-mcell { padding: 2px 1px; }
+  .agg-chip { padding: 1px 2px; font-size: 10px; }
+  .agg-chip-t { display: none; }
+  .agg-fgrid { grid-template-columns: minmax(0, 1fr); }
+  .agg-add { margin-left: 0; }
+}
+/* Dokunmatik / dar ekran: dokunma hedefleri en az 24 px (WCAG 2.5.8). Boyutlandırma tutamağı bloğun %45'ine dek büyür (kısa
+   blokta 9 px kalır: bloğun kendisi taşıma hedefi olarak kalsın); görünen çizgi aynı. */
+@media (max-width: 640px), (pointer: coarse) {
+  .agg-chip { min-height: 24px; line-height: 20px; }
+  .agg-more { min-width: 24px; min-height: 24px; }
+  .agg-handle { height: clamp(9px, 45%, 18px); }
+}

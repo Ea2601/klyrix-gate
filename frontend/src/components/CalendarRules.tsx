@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { CalendarCheck, Plus, Trash2, Pencil, Loader2, AlertTriangle, Info, Eye, Check, X, Square, Hash, Gauge, ShieldOff, ShieldCheck, Users, Smartphone, BellRing } from 'lucide-react';
 import { useApi, getApi, postApi, putApi, deleteApi } from '../hooks/useApi';
@@ -6,6 +6,7 @@ import { Panel, Select, SelectOption } from './ui';
 import { parseDbTime } from '../time';
 import { toast } from '../toast';
 import type { Device } from '../types';
+import { emitCalendarChanged, onCalendarChanged } from './agendaShared';
 import './CalendarRules.css';
 
 // Takvim kuralları (Ağ Ajandası sayfası; backend calendarEngine.ts, /api/calendar/{engine,profiles,bindings,local-events,
@@ -85,15 +86,20 @@ function actionsText(a: Actions, rules: PRule[], groups: Group[]): string[] {
   return out;
 }
 
-// Yan etkisiz önizleme: etkilenen cihazlar, askıya alınan / açılan kurallar, çakışmalar
+// Yan etkisiz önizleme: etkilenen cihazlar, askıya alınan / açılan kurallar, çakışmalar (Ağ Ajandası ızgarası da kullanır).
 // dwNote: "Yeni cihaz bildirimi kapalı" uyarısı (profil düzenleyici kendi bağlantılı uyarısını gösterir)
-function PreviewBox({ query, dwNote = true }: { query: string; dwNote?: boolean }) {
+// onReady (yalnız ızgara penceresi): gösterilen sorgu — yanıt ya da hata görününce; pencere Kaydet'i buna bağlar.
+export function PreviewBox({ query, dwNote = true, onReady }: { query: string; dwNote?: boolean; onReady?: (query: string) => void }) {
   // Yanıt sorgusuyla birlikte tutulur: sorgu değişince eski önizleme gösterilmez (yeni yanıt gelene dek "hazırlanıyor")
   const [res, setRes] = useState<{ q: string; p?: Preview; err?: string } | null>(null);
+  const readyRef = useRef(onReady);
+  useEffect(() => { readyRef.current = onReady; }, [onReady]);
   useEffect(() => {
     let on = true;
     const t = setTimeout(() => {
-      getApi<Preview>(`/calendar/preview?${query}`).then(r => { if (on) setRes({ q: query, p: r }); }).catch(e => { if (on) setRes({ q: query, err: errText(e) }); });
+      getApi<Preview>(`/calendar/preview?${query}`)
+        .then(r => { if (on) { setRes({ q: query, p: r }); readyRef.current?.(query); } })
+        .catch(e => { if (on) { setRes({ q: query, err: errText(e) }); readyRef.current?.(query); } });
     }, 250);
     return () => { on = false; clearTimeout(t); };
   }, [query]);
@@ -152,6 +158,11 @@ export function CalendarRules({ tz }: { tz?: string }) {
   const localB = bindings.filter(x => x.enabled && (x.sources === null || x.sources.includes('local')));
   const localTags = [...new Set(localB.map(x => x.tag))];
   const all = async () => { await Promise.all([refEng(), refDec(), refProf(), refBind(), refLoc()]); };
+  // Aynı sayfadaki ızgara (G5.5) yerel etkinlik yazınca / ızgaradayken Yenile: durum ve listeler yeniden okunur (Liste
+  // görünümünde bu bölümün davranışı değişmez)
+  useEffect(() => onCalendarChanged(from => {
+    if (from === 'grid' || from === 'refresh') void Promise.all([refEng(), refDec(), refLoc()]);
+  }), [refEng, refDec, refLoc]);
 
   if (engErr === 'HTTP 409') return null;   // uydu: ajanda zaten uyarır
 
@@ -159,7 +170,7 @@ export function CalendarRules({ tz }: { tz?: string }) {
   const run = async (id: string, fn: () => Promise<unknown>, ok?: string): Promise<boolean> => {
     setBusy(id);
     let done = false;
-    try { await fn(); done = true; if (ok) toast.success(ok); await all(); } catch (e) { toast.error(errText(e)); } finally { setBusy(null); }
+    try { await fn(); done = true; if (ok) toast.success(ok); emitCalendarChanged('rules'); await all(); } catch (e) { toast.error(errText(e)); } finally { setBusy(null); }
     return done;
   };
   const setEngine = (enabled: boolean) => {
