@@ -6,8 +6,9 @@ import { promises as dnsPromises } from 'dns';
 import sqlite3 from 'sqlite3';
 import { shq } from './util';
 import { recordEventOnce } from './events';
-import { encodeRouteMark, decodeVpsMark, decodeLegacyVpsMark, isManagedRuleMark, normFallback, DPI_ONLY_MARK, LEGACY_DPI_ONLY_MARK, ISP_FALLBACK_BIT, ROUTE_MARK_MASK, LEARN_MARK_BIT, type VpsMark } from './routeMarks';
+import { encodeRouteMark, decodeVpsMark, decodeLegacyVpsMark, isManagedRuleMark, normFallback, normBackup, pickMarkTunnel, DPI_ONLY_MARK, LEGACY_DPI_ONLY_MARK, ISP_FALLBACK_BIT, ROUTE_MARK_MASK, LEARN_MARK_BIT, type VpsMark } from './routeMarks';
 import { planListRouting, configureListDns, listSetForName, parseUpstreams, type ListRoute } from './listDns';
+import { confFullTunnel } from './wgConf';
 import { collapsedList } from './categoryLists';
 
 const execAsync = promisify(exec);
@@ -1155,11 +1156,12 @@ interface DomainRoute {
   dpi_bypass: number;  // 0 or 1
   enabled: number;
   redirect_url?: string; // if set, DNS-redirect domain to Pi5 IP → HTTP redirect to this URL
-  vps_fallback?: string; // VPS çıkışında tünel düşerse: 'block' (varsayılan) | 'isp'
+  vps_fallback?: string; // VPS çıkışında tünel düşerse: 'block' (varsayılan) | 'isp' | 'tunnel' | 'tunnel-isp' (routeMarks)
+  vps_backup?: string;   // yedek tünel ('tunnel*'): '' / 'auto' = çalışan ilk tünel, '7' = o VPS
 }
 // IP aralığı kuralı (bkz. ipRanges.ts): DNS'e dayanmayan trafik (ör. WhatsApp aramaları) için. prefixes normalize edilmiş
 // IPv4 CIDR'lardır; excludeWeb → 443 (tcp/udp) yönlendirilmez (aynı sunuculardaki web trafiği yerel kalır).
-export interface RangeRoute { exit_node: string; dpi_bypass: number; prefixes: string[]; excludeWeb: boolean; vps_fallback?: string }
+export interface RangeRoute { exit_node: string; dpi_bypass: number; prefixes: string[]; excludeWeb: boolean; vps_fallback?: string; vps_backup?: string }
 // Statik IP aralığı seti (hash:net; dnsmasq doldurmaz): rt_n<mark> tüm portlar, rt_x<mark> 443 hariç.
 type NetSet = { mark: number; excludeWeb: boolean; prefixes: Set<string> };
 const CIDR_LINE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
@@ -2053,11 +2055,12 @@ export async function applyDomainRouting(domains?: DomainRoute[], ranges: RangeR
     console.error('[routing] nginx yönlendirme haritası yazılamadı:', e?.message || e);
   }
 
-  // İşaret şeması: routeMarks.ts — ISP (0), yalnız DPI (200), VPS tüneli 0x8000|id (+DPI, +tünel düşerse operatörden
-  // devam). Geçersiz çıkış (VPS kimliği sayı değil / 8191'den büyük) ISP sayılır ve günlüğe yazılır.
+  // İşaret şeması: routeMarks.ts — ISP (0), yalnız DPI (0x4000), VPS tüneli 0x8000|id (+DPI, +tünel düşerse operatörden
+  // devam), yedek tünelli kural 0x8000|0x1000|yuva (yuvalar index.ts'te routeSlots.prepareRouteSlots ile önceden hazır).
+  // Geçersiz çıkış (VPS kimliği sayı değil / 4095'ten büyük) ISP sayılır ve günlüğe yazılır.
   const badExits = new Set<string>();
-  function getFwmark(exit_node: string, dpi_bypass: number, vps_fallback?: string): number {
-    const m = encodeRouteMark(String(exit_node || 'isp'), !!dpi_bypass, normFallback(vps_fallback));
+  function getFwmark(exit_node: string, dpi_bypass: number, vps_fallback?: string, vps_backup?: string): number {
+    const m = encodeRouteMark(String(exit_node || 'isp'), !!dpi_bypass, normFallback(vps_fallback), normBackup(vps_backup));
     if (m !== null) return m;
     badExits.add(String(exit_node));
     return dpi_bypass ? DPI_ONLY_MARK : 0;
@@ -2068,7 +2071,7 @@ export async function applyDomainRouting(domains?: DomainRoute[], ranges: RangeR
   const markSets = new Map<number, string>(); // mark → ipset name
 
   for (const d of routingDomains) {
-    const mark = getFwmark(d.exit_node, d.dpi_bypass, d.vps_fallback);
+    const mark = getFwmark(d.exit_node, d.dpi_bypass, d.vps_fallback, d.vps_backup);
     if (mark === 0) continue; // default route, no special routing needed
     const setName = `rt_m${mark}`;
     if (!markSets.has(mark)) markSets.set(mark, setName);
@@ -2081,7 +2084,7 @@ export async function applyDomainRouting(domains?: DomainRoute[], ranges: RangeR
   //     server= ile panelin ileticisine gider, iletici adresleri kuralın setine ekler (ipset= ile 83 bin satır her
   //     sorguyu yavaşlatırdı). Yalnız DPI'da set 0x4000 işaretini verir, Zapret o işarete bakar. İşaret satırı setin
   //     değişimini izletir.
-  const listPlan = planListRouting(opts.lists || [], r => getFwmark(r.exit_node, r.dpi_bypass, r.vps_fallback),
+  const listPlan = planListRouting(opts.lists || [], r => getFwmark(r.exit_node, r.dpi_bypass, r.vps_fallback, r.vps_backup),
     collapsedList, d => VALID_DNSMASQ_DOMAIN.test(d));
   for (const [mark, set] of listPlan.marks) if (!markSets.has(mark)) markSets.set(mark, set);
   ipsetLines.push(...listPlan.markers);
@@ -2091,7 +2094,7 @@ export async function applyDomainRouting(domains?: DomainRoute[], ranges: RangeR
   // 1b. IP aralığı setleri (kuralın çıkışına göre): aynı çıkış + aynı kip (tüm portlar / 443 hariç) tek sette birleşir.
   const netSets = new Map<string, NetSet>();
   for (const r of ranges) {
-    const mark = getFwmark(r.exit_node, r.dpi_bypass, r.vps_fallback);
+    const mark = getFwmark(r.exit_node, r.dpi_bypass, r.vps_fallback, r.vps_backup);
     if (mark === 0) continue;
     const name = `${r.excludeWeb ? 'rt_x' : 'rt_n'}${mark}`;
     const e = netSets.get(name) || { mark, excludeWeb: r.excludeWeb, prefixes: new Set<string>() };
@@ -2432,9 +2435,21 @@ async function readLocalRules(): Promise<{ twin: Map<number, number>; main: Map<
 //  - "engelle" (0x2000 yok): tabanda kalıcı `unreachable default metric 1000` — tünel rotası (metric 0) varken o seçilir,
 //    yokken paket hemen reddedilir (uygulama hata alır), ISP'ye SIZMAZ. Arayüz silinince çekirdek tünel rotasını kaldırır.
 //  - "operatörden devam" (0x2000): tabloda yalnız tünel rotası; yokken tablo boş → kural eşleşmez, ana tablo (ISP).
-// Tünel rotası arayüz varsa ve tünel "yanıt vermiyor" onaylanmamışsa konur; onaylıysa kaldırılır (izleyici, index.ts).
+// Tünel rotası kullanılabilir tünele konur (arayüz var + "yanıt vermiyor" onaylanmamış — izleyici, index.ts): ana tünel; o
+// değilse ve kural yedek tünel istiyorsa (0x1000) yedek (routeMarks.pickMarkTunnel). Önce yeni rota yazılır (replace: aynı
+// anahtarlı eskisinin yerine — geçişte boşluk yok, operatöre sızmaz), sonra tabloda kalan başka tünel rotaları silinir.
+export const tunnelUsable = (id: number, staleVps: ReadonlySet<number>) => !staleVps.has(id) && fs.existsSync(`/sys/class/net/wg_vps${id}`);
+// Otomatik yedeğin adayları, sırasıyla: Pi'deki VPS tünelleri (arayüzü olanlar), kimliğe göre artan; yalnız interneti taşıyanlar
+// — içe aktarılan bölünmüş tünel (ör. yalnız şirket ağı) başka adreslere gideni düşürürdü (wgConf.confFullTunnel).
+export function vpsTunnelIds(): number[] {
+  let names: string[] = [];
+  try { names = fs.readdirSync('/sys/class/net'); } catch { return []; }
+  const full = (id: number) => {
+    try { return confFullTunnel(fs.readFileSync(`/etc/wireguard/wg_vps${id}.conf`, 'utf8')); } catch { return false; }
+  };
+  return names.map(n => /^wg_vps(\d+)$/.exec(n)?.[1]).filter((x): x is string => !!x).map(Number).sort((a, b) => a - b).filter(full);
+}
 async function syncMarkTable(mark: number, v: VpsMark, staleVps: ReadonlySet<number>): Promise<void> {
-  const iface = `wg_vps${v.vpsId}`;
   if (!v.ispFallback) {
     await run(`ip route replace unreachable default metric 1000 table ${mark} 2>/dev/null || true`);
     // Kill-switch doğrulaması: kurulamadıysa tünel düşünce bu kuralların trafiği operatöre (ISP) sızar — sessiz kalmasın
@@ -2443,18 +2458,21 @@ async function syncMarkTable(mark: number, v: VpsMark, staleVps: ReadonlySet<num
       void recordEventOnce('routing', `Kill-switch kurulamadı (VPS ${v.vpsId}, tablo ${mark}): tünel düşerse "engelle" kuralları operatöre sızabilir`, 'critical', 60);
     }
   }
-  if (!fs.existsSync(`/sys/class/net/${iface}`)) return;
-  if (staleVps.has(v.vpsId)) {
-    await run(`ip route del default dev ${iface} table ${mark} 2>/dev/null || true`);
-    return;
+  const target = pickMarkTunnel(v, id => tunnelUsable(id, staleVps), vpsTunnelIds);
+  const iface = target === null ? '' : `wg_vps${target}`;
+  if (iface) {
+    await run(`ip route replace default dev ${iface} table ${mark} 2>/dev/null || true`);
+    // Tünelden dönen yanıtlar işaretsiz gelir; katı rp_filter (1) onları düşürür → bu arayüzde gevşek (2).
+    await run(`sysctl -q -w net.ipv4.conf.${iface}.rp_filter=2 2>/dev/null || true`);
   }
-  await run(`ip route replace default dev ${iface} table ${mark} 2>/dev/null || true`);
-  // Tünelden dönen yanıtlar işaretsiz gelir; katı rp_filter (1) onları düşürür → bu arayüzde gevşek (2).
-  await run(`sysctl -q -w net.ipv4.conf.${iface}.rp_filter=2 2>/dev/null || true`);
+  for (const m of (await run(`ip route show table ${mark} 2>/dev/null`)).matchAll(/^default dev (wg_vps\d+)/gm)) {
+    if (m[1] !== iface) await run(`ip route del default dev ${m[1]} table ${mark} 2>/dev/null || true`);
+  }
 }
 
-// Tünel "yanıt vermiyor" olunca / yeniden yanıt verince izleyici çağırır: yalnız tablo rotaları güncellenir (dnsmasq,
-// zincir ve NAT'a dokunulmaz). Tablolar kurulu "fwmark N lookup N" ve Pi'nin kendi trafiği kurallarından bulunur.
+// Kullanılabilir tüneller değişince (yanıt vermiyor onayı / yeniden yanıt / arayüz kalktı ya da geldi) izleyici çağırır:
+// yalnız tablo rotaları güncellenir (dnsmasq, zincir ve NAT'a dokunulmaz) — yedek tünele geçiş ve ana tünele dönüş burada.
+// Tablolar kurulu "fwmark N lookup N" ve Pi'nin kendi trafiği kurallarından bulunur.
 export async function syncVpsRoutes(staleVps: ReadonlySet<number>): Promise<void> {
   if (!isLinux) return;
   const tables = new Set<number>([...(await readManagedRules()).keys()]);

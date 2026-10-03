@@ -271,6 +271,15 @@ export function importSummary(stored: unknown): ImportSummary | null {
   return { address: c.address, endpoint: `${host}:${c.endpointPort}`, allowed_ips: c.allowedIps, full_tunnel: c.fullTunnel, mtu: c.mtu };
 }
 
+// Pi'deki tünel yapılandırması (/etc/wireguard/wg_vps<N>.conf metni) interneti taşıyor mu: AllowedIPs IPv4'ün en az yarısını
+// kaplıyor (fullTunnel ile aynı ölçü; IPv6 aralıkları sayılmaz). Yönlendirmenin otomatik yedek tüneli bölünmüş tünel olamaz
+// (system.ts): yalnız şirket ağını taşıyan tünel başka adreslere gideni düşürürdü.
+export function confFullTunnel(text: string): boolean {
+  const nets = [...String(text).matchAll(/^\s*AllowedIPs\s*=\s*(.*)$/gim)].flatMap(m => m[1].split(','))
+    .map(s => parseCidr4(s)?.net).filter((x): x is string => !!x);
+  return nets.length > 0 && coverage(nets) >= 2 ** 31;
+}
+
 // Ev VPN'i dış erişim testinin (wgServer.ts) deneme paketlerini çıkaracağı tüneller, tercih sırasıyla: panelin kendi VPS
 // tünelleri önce (sıraları korunur), sonra internet trafiğini taşıyan içe aktarılan tüneller. Bölünmüş içe aktarılan tünel hiç
 // kullanılmaz: paketler evin dış adresine ulaşamaz, test yanlışlıkla "ulaşılamıyor" derdi. imported: arayüz → interneti taşıyor mu.

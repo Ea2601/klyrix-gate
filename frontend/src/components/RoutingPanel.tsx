@@ -9,7 +9,7 @@ import { Panel, Badge, Select, SelectOption } from './ui';
 import { AppLogo } from './AppLogos';
 import { CAT_ICON } from './contentCategories';
 import { toast } from '../toast';
-import type { TrafficRule } from '../types';
+import type { TrafficRule, VpsFallback } from '../types';
 import './RoutingPanel.css';
 
 type RoutingTab = 'apps' | 'domains';
@@ -39,7 +39,7 @@ const fmtN = (n: number) => n.toLocaleString('tr-TR');
 interface VpsServer { id: number; ip: string; location: string }
 
 // Zapret'in kısa durumu (GET /routing/rules ve /routing/domains yanıtında). DPI'ı açık kural Zapret çalışmıyorsa hiçbir
-// trafiğe dokunmaz — kartta nedeniyle söylenir: çıkışı ISP olan kuralda hemen, VPS + "operatörden devam" kuralında tünel
+// trafiğe dokunmaz — kartta nedeniyle söylenir: çıkışı ISP olan kuralda hemen, VPS + son seçimi operatör olan kuralda tünel
 // düşünce (tünel çalışırken DPI kullanılmaz: trafik wg'den şifreli çıkar). VPS + "engelle"de DPI hiç kullanılmaz.
 interface ZapretBrief { installed: boolean; issue: string | null; active: boolean }
 const dpiInactiveReason = (z: ZapretBrief | undefined): string | null => {
@@ -55,14 +55,37 @@ function DpiInactive({ why, vps }: { why: string; vps: boolean }) {
   );
 }
 
-// VPS çıkışlı kuralda tünel kapanınca / VPS yanıt vermeyince ne olacağı (backend routeMarks.ts, kural başına).
-const FALLBACK_TITLE = "VPS tüneli kapanırsa ya da VPS yanıt vermezse — engelle: bu trafik operatörden (ISP) çıkmaz, site açılmaz; operatörden devam: trafik ISP üzerinden sürer (gerçek konumunuz görünür), kuralda DPI açıksa DPI atlatmayla";
-function FallbackSelect({ value, dpi, onChange }: { value: string | undefined; dpi: boolean; onChange: (v: 'block' | 'isp') => void }) {
+// VPS çıkışlı kuralda tünel kapanınca / VPS yanıt vermeyince ne olacağı (backend routeMarks.ts, kural başına): engelle,
+// operatörden devam ya da başka tünelden (yedek: otomatik ya da seçilen VPS) — yedek de yoksa engelle / operatörden.
+const FALLBACKS: VpsFallback[] = ['block', 'isp', 'tunnel', 'tunnel-isp'];
+const normFallback = (v: unknown): VpsFallback => (FALLBACKS.includes(v as VpsFallback) ? v as VpsFallback : 'block');
+const tunnelFallback = (f: VpsFallback) => f === 'tunnel' || f === 'tunnel-isp';
+// Son seçim operatör: tünel (ve yedeği) yokken trafik modemden çıkar — DPI orada uygulanır
+const ispFinal = (f: VpsFallback) => f === 'isp' || f === 'tunnel-isp';
+const FALLBACK_TITLE = "VPS tüneli kapanırsa ya da VPS yanıt vermezse — engelle: bu trafik operatörden (ISP) çıkmaz, site açılmaz; operatörden devam: trafik ISP üzerinden sürer (gerçek konumunuz görünür), kuralda DPI açıksa DPI atlatmayla; yedek → engelle / operatör: trafik çalışan yedek VPS tünelinden sürer, ana tünel dönünce ona geri geçer — yedek de yoksa engellenir ya da operatörden devam eder";
+function FallbackSelect({ value, dpi, onChange }: { value: string | undefined; dpi: boolean; onChange: (v: VpsFallback) => void }) {
   return (
-    <Select className="config-select config-select-sm" value={value === 'isp' ? 'isp' : 'block'}
-      onChange={e => onChange(e.target.value === 'isp' ? 'isp' : 'block')} title={FALLBACK_TITLE} aria-label="Tünel düşerse">
+    <Select className="config-select config-select-sm" value={normFallback(value)}
+      onChange={e => onChange(normFallback(e.target.value))} title={FALLBACK_TITLE} aria-label="Tünel düşerse">
       <option value="block">Tünel düşerse: engelle</option>
       <option value="isp">{dpi ? 'Tünel düşerse: operatörden + DPI' : 'Tünel düşerse: operatörden devam'}</option>
+      {/* Kısa: 360 px telefonda da son seçim (engelle / operatör) okunur; açıklaması title'da */}
+      <option value="tunnel">Tünel düşerse: yedek → engelle</option>
+      <option value="tunnel-isp">{dpi ? 'Tünel düşerse: yedek → ISP + DPI' : 'Tünel düşerse: yedek → operatör'}</option>
+    </Select>
+  );
+}
+// Yedek tünel ('' / 'auto' = otomatik). Listede olmayan değer (silinmiş VPS, kuralın kendi çıkışı) otomatik görünür — sunucu
+// da öyle uygular. Başka VPS yoksa seçici yerine not: yedek, VPS eklenince otomatik kullanılır.
+function BackupSelect({ value, exit, vpsList, onChange }: { value: string | undefined; exit: string; vpsList: VpsServer[]; onChange: (v: string) => void }) {
+  const others = vpsList.filter(v => String(v.id) !== exit);
+  if (!others.length) return <span className="rt-fb-note">Yedek: başka VPS tüneli yok — eklenince otomatik kullanılır</span>;
+  const cur = others.some(v => String(v.id) === value) ? String(value) : 'auto';
+  return (
+    <Select className="config-select config-select-sm" value={cur} onChange={e => onChange(e.target.value)} aria-label="Yedek tünel"
+      title="Ana tünel düşünce trafiğin geçeceği tünel — otomatik: Pi'de çalışan ilk VPS tüneli (numara sırasıyla; yalnız interneti taşıyan tüneller)">
+      <option value="auto">Yedek: otomatik (ilk çalışan)</option>
+      {others.map(v => <SelectOption key={v.id} value={String(v.id)} cols={[`Yedek: VPS ${v.location}`, v.ip]} />)}
     </Select>
   );
 }
@@ -345,7 +368,8 @@ function AppRoutingView({ onApplied }: { onApplied: () => void }) {
                   const exitNode = edits.value(rule.id, 'exit_node', rule.exit_node || 'isp');
                   const dpi = edits.value(rule.id, 'dpi_bypass', rule.dpi_bypass || 0);
                   const enabled = edits.value(rule.id, 'enabled', rule.enabled);
-                  const fallback = edits.value(rule.id, 'vps_fallback', rule.vps_fallback);
+                  const fallback = normFallback(edits.value(rule.id, 'vps_fallback', rule.vps_fallback));
+                  const backup = edits.value(rule.id, 'vps_backup', rule.vps_backup);
                   const saving = edits.busy(rule.id);
                   const isActive = enabled && exitNode !== 'isp';
                   const isExpanded = expandedId === rule.id;
@@ -388,6 +412,9 @@ function AppRoutingView({ onApplied }: { onApplied: () => void }) {
                         {exitNode !== 'isp' && (
                           <div className="rt-fb">
                             <FallbackSelect value={fallback} dpi={!!dpi} onChange={v => handleChange(rule.id, 'vps_fallback', v)} />
+                            {tunnelFallback(fallback) && (
+                              <BackupSelect value={backup} exit={exitNode} vpsList={vpsList} onChange={v => handleChange(rule.id, 'vps_backup', v)} />
+                            )}
                           </div>
                         )}
 
@@ -399,7 +426,7 @@ function AppRoutingView({ onApplied }: { onApplied: () => void }) {
                           <StateToggle on={!!enabled} label={rule.app_name} onClick={() => handleChange(rule.id, 'enabled', enabled ? 0 : 1)} />
                         </div>
                       </div>
-                      {enabled && dpi && (exitNode === 'isp' || fallback === 'isp') && dpiWhy
+                      {enabled && dpi && (exitNode === 'isp' || ispFinal(fallback)) && dpiWhy
                         ? <DpiInactive why={dpiWhy} vps={exitNode !== 'isp'} /> : null}
 
                       {isExpanded && list && (
@@ -464,7 +491,8 @@ interface DomainRule {
   description: string;
   enabled: number;
   redirect_url?: string;
-  vps_fallback?: 'block' | 'isp';
+  vps_fallback?: VpsFallback;
+  vps_backup?: string;
   created_at: string;
 }
 
@@ -746,7 +774,8 @@ function DomainRoutingView({ onApplied }: { onApplied: () => void }) {
             const exitNode = edits.value(d.id, 'exit_node', d.exit_node || 'isp');
             const dpi = edits.value(d.id, 'dpi_bypass', d.dpi_bypass || 0);
             const enabled = edits.value(d.id, 'enabled', d.enabled);
-            const fallback = edits.value(d.id, 'vps_fallback', d.vps_fallback);
+            const fallback = normFallback(edits.value(d.id, 'vps_fallback', d.vps_fallback));
+            const backup = edits.value(d.id, 'vps_backup', d.vps_backup);
             const saving = edits.busy(d.id);
             // Yalnız öneri üretebilen kural (etkin, redirect değil, VPS ya da DPI) — sunucu yanıtı 2 dk'ya kadar eski olabilir.
             const rs = enabled && !d.redirect_url && (exitNode !== 'isp' || dpi) ? sugByRule.get(d.id) : undefined;
@@ -789,6 +818,9 @@ function DomainRoutingView({ onApplied }: { onApplied: () => void }) {
                 {hasFb && (
                   <div className="rt-fb">
                     <FallbackSelect value={fallback} dpi={!!dpi} onChange={v => handleChange(d.id, 'vps_fallback', v)} />
+                    {tunnelFallback(fallback) && (
+                      <BackupSelect value={backup} exit={exitNode} vpsList={vpsList} onChange={v => handleChange(d.id, 'vps_backup', v)} />
+                    )}
                   </div>
                 )}
 
@@ -803,7 +835,7 @@ function DomainRoutingView({ onApplied }: { onApplied: () => void }) {
                   </button>
                 </div>
               </div>
-              {enabled && dpi && (exitNode === 'isp' || fallback === 'isp') && !d.redirect_url && dpiWhy
+              {enabled && dpi && (exitNode === 'isp' || ispFinal(fallback)) && !d.redirect_url && dpiWhy
                 ? <DpiInactive why={dpiWhy} vps={exitNode !== 'isp'} /> : null}
 
               {rs && rs.suggestions.length > 0 && (

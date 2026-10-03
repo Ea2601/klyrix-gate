@@ -18,7 +18,7 @@ const HOST = '127.0.0.1';
 const UPSTREAM_TIMEOUT_MS = 2500;
 const IPSET_TIMEOUT_MS = 2000;
 
-export type ListRoute = { id: ListId; exit_node: string; dpi_bypass: number; vps_fallback?: string };
+export type ListRoute = { id: ListId; exit_node: string; dpi_bypass: number; vps_fallback?: string; vps_backup?: string };
 export type Upstream = { host: string; port: number };
 
 // ── Plan (saf): liste satırları → dnsmasq satırları ve setler ─────────────────────────────────────────────────────────

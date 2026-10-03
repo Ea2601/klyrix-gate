@@ -12,7 +12,8 @@ import { importSummary } from './wgConf';
 import { syncRemoteAccess, panelAccessConflict, clientTunnelIp, cidrOverlaps, localNetworks, RELAY_NET, PANEL_TUNNEL_URL, type RelayRow } from './remoteAccess';
 import { validateFwRule, fwRuleToNft, accessCheck, isPanelLockoutForAll, blocksWholeLan, describeRule } from './firewall';
 import { fail2banSettingsView, validateFail2banSettings, applyFail2banSettings, ensureFail2ban, recentBans, unbanIp, lanNetworks } from './fail2ban';
-import { normFallback } from './routeMarks';
+import { normFallback, normBackup, tunnelFallback, ispFinal, pickMarkTunnel } from './routeMarks';
+import { prepareRouteSlots } from './routeSlots';
 import { systemServices } from './services';
 import { startHealthMonitor, getHealthStatus } from './monitor';
 import { startCronJobs, getSystemLogs, clearSystemLogs } from './maintenance';
@@ -25,7 +26,7 @@ import {
   sampleMetrics, detectInterfaces, recoverInterruptedFtlRestart, VALID_DNSMASQ_DOMAIN, getRoutingApplyStatus,
   getLanIdentity, protectedMacs, getPi5LanIp, readNetModeState, runExclusiveDnsTask, AP_ADDR, AP_NET, HOME_BRIDGE,
   wanActive, uplinkIfaces, readFailoverStatus, activeUplink, sameNetActive, readRepLanStatus, syncVpsRoutes,
-  legacyRoutingCleanupDue,
+  legacyRoutingCleanupDue, tunnelUsable, vpsTunnelIds,
 } from './system';
 import type { RangeRoute } from './system';
 import { listForwards, addForward, setForwardEnabled, deleteForward, applyPortForwards, prepareForwardRestore } from './wan';
@@ -1911,10 +1912,11 @@ app.get('/api/vps/:id/tunnel-status', async (req, res) => {
   } catch { res.json(down); }
 });
 
-// "Tünel Kes" / "VPS Sil" onay metni: bu VPS'e yönlenen etkin kurallar (engellenecek / operatörden devam edecek).
+// "Tünel Kes" / "VPS Sil" onay metni: bu VPS'e yönlenen etkin kurallar (yedek tünele geçecek / engellenecek / operatörden
+// devam edecek).
 app.get('/api/vps/:id/routing-usage', async (req, res) => {
   const id = validVpsId(req.params.id);
-  if (id === null) return res.json({ block: [], isp: [] });
+  if (id === null) return res.json({ block: [], isp: [], tunnel: [] });
   try {
     res.json(await vpsRuleUsage(id));
   } catch (e: any) {
@@ -1943,10 +1945,13 @@ app.delete('/api/vps/:id', async (req, res) => {
         clientNote = `VPS'e ulaşılamadı (${e?.message || e}) — ${clients.length} istemci VPS'te kalmış olabilir`;
       }
     }
-    // Bu VPS'e yönlenen kurallar operatöre (ISP) çevrilir: "engelle" kuralları sahipsiz kalıcı engele dönmesin.
+    // Bu VPS'e yönlenen kurallar operatöre (ISP) çevrilir: "engelle" kuralları sahipsiz kalıcı engele dönmesin. Bu VPS'i
+    // yedek tünel seçen kurallar otomatik yedeğe (çalışan ilk tünel) döner.
     const usage = await vpsRuleUsage(req.params.id);
     await dbRun(`UPDATE traffic_routing SET exit_node = 'isp' WHERE exit_node = ?`, [String(req.params.id)]);
     await dbRun(`UPDATE domain_routing SET exit_node = 'isp' WHERE exit_node = ?`, [String(req.params.id)]);
+    await dbRun(`UPDATE traffic_routing SET vps_backup = 'auto' WHERE vps_backup = ?`, [String(req.params.id)]);
+    await dbRun(`UPDATE domain_routing SET vps_backup = 'auto' WHERE vps_backup = ?`, [String(req.params.id)]);
     await dbRun('DELETE FROM wg_clients WHERE vps_id = ?', [req.params.id]);
     await dbRun('DELETE FROM vps_servers WHERE id = ?', [req.params.id]);
     // Hazır yapılandırma: özel anahtarı taşıyan dosya Pi'den silinir, koruma tablosu kalan tünellere göre yazılır (wgImport.ts).
@@ -1955,7 +1960,7 @@ app.delete('/api/vps/:id', async (req, res) => {
     }
     await applyAllRoutingRules().catch((e: any) => console.error('Routing yeniden uygulanamadı:', e.message));
     await syncRelay().catch((e: any) => console.error('[uzaktan yönetim] uygulanamadı:', e.message));
-    const moved = [...usage.block, ...usage.isp];
+    const moved = [...usage.tunnel, ...usage.block, ...usage.isp];
     if (server) {
       const notes = [
         ...(moved.length ? [`${moved.length} kural operatöre (ISP) çevrildi: ${nameList(moved)}`] : []),
@@ -2005,18 +2010,38 @@ function syncRelay(): Promise<void> {
   return relayQueued;
 }
 
-// Bir VPS'e yönlenen etkin kurallar, tünel düşünce ne olacağına göre (uygulama adı / alan adı).
-async function vpsRuleUsage(vpsId: string | number): Promise<{ block: string[]; isp: string[] }> {
+// Bir VPS'e yönlenen etkin kurallar, tünel düşünce ne olacağına göre (uygulama adı / alan adı). Yedek tünelli kural şu an
+// kullanılabilir bir yedek varsa "tunnel", yoksa son seçimine göre engel / operatör (tablo seçimiyle aynı: pickMarkTunnel).
+type RuleUsage = { block: string[]; isp: string[]; tunnel: string[] };
+async function vpsRuleUsage(vpsId: string | number): Promise<RuleUsage> {
   const id = String(vpsId);
-  const apps = await dbAll(`SELECT app_name AS name, vps_fallback FROM traffic_routing WHERE enabled = 1 AND exit_node = ? AND domains != ''`, [id]) as any[];
-  const doms = await dbAll(`SELECT domain AS name, vps_fallback FROM domain_routing WHERE enabled = 1 AND exit_node = ? AND COALESCE(redirect_url, '') = ''`, [id]) as any[];
-  const out = { block: [] as string[], isp: [] as string[] };
-  for (const r of [...apps, ...doms]) out[normFallback(r.vps_fallback)].push(String(r.name));
+  const apps = await dbAll(`SELECT app_name AS name, vps_fallback, vps_backup FROM traffic_routing WHERE enabled = 1 AND exit_node = ? AND domains != ''`, [id]) as any[];
+  const doms = await dbAll(`SELECT domain AS name, vps_fallback, vps_backup FROM domain_routing WHERE enabled = 1 AND exit_node = ? AND COALESCE(redirect_url, '') = ''`, [id]) as any[];
+  const known = new Set((await dbAll('SELECT id FROM vps_servers') as any[]).map(r => String(r.id)));
+  const out: RuleUsage = { block: [], isp: [], tunnel: [] };
+  for (const r of [...apps, ...doms]) {
+    const f = normFallback(r.vps_fallback);
+    if (tunnelFallback(f)) {
+      const b = routeBackup(r.vps_backup, id, known);
+      const v = { vpsId: Number(id), dpi: false, ispFallback: false, backup: b ? Number(b) : 0 };
+      if (pickMarkTunnel(v, n => n !== v.vpsId && tunnelUsable(n, staleTunnels()), vpsTunnelIds) !== null) {
+        out.tunnel.push(String(r.name));
+        continue;
+      }
+    }
+    out[ispFinal(f) ? 'isp' : 'block'].push(String(r.name));
+  }
   return out;
 }
+// Kuralın yedek tüneli: kayıtlı olmayan (silinmiş) VPS ya da kuralın kendi çıkışı → '' (otomatik: çalışan ilk tünel).
+function routeBackup(backup: unknown, exit: string, known: ReadonlySet<string>): string {
+  const b = normBackup(backup);
+  return b && known.has(String(b)) && String(b) !== exit ? String(b) : '';
+}
 const nameList = (names: string[], max = 5) => names.slice(0, max).join(', ') + (names.length > max ? ` +${names.length - max}` : '');
-function routeEffectText(u: { block: string[]; isp: string[] }): string {
+function routeEffectText(u: RuleUsage): string {
   const parts: string[] = [];
+  if (u.tunnel.length) parts.push(`${u.tunnel.length} kural yedek tünelden devam ediyor (${nameList(u.tunnel)})`);
   if (u.block.length) parts.push(`${u.block.length} kural engellendi (${nameList(u.block)})`);
   if (u.isp.length) parts.push(`${u.isp.length} kural operatörden devam ediyor (${nameList(u.isp)})`);
   return parts.join('; ');
@@ -2028,20 +2053,21 @@ async function applyAllRoutingRulesNow() {
   // 1. App routing: expand domains column into individual domain entries
   // Trafik Kontrolü → Zamanlayıcı: etkin pencere kuralın çıkışının / DPI'ının yerine geçer (trafficSchedule.ts)
   const schedOv = await loadOverrides();
-  const appRules = applyOverrides(await dbAll('SELECT id, app_name, domains, exit_node, dpi_bypass, vps_fallback, enabled FROM traffic_routing WHERE enabled = 1 AND domains != ""') as any[], schedOv);
+  const appRules = applyOverrides(await dbAll('SELECT id, app_name, domains, exit_node, dpi_bypass, vps_fallback, vps_backup, enabled FROM traffic_routing WHERE enabled = 1 AND domains != ""') as any[], schedOv);
   noteScheduleApplied(overrideSig(schedOv));
-  const domainRules = await dbAll('SELECT domain, exit_node, dpi_bypass, vps_fallback, enabled, redirect_url FROM domain_routing WHERE enabled = 1');
+  const domainRules = await dbAll('SELECT domain, exit_node, dpi_bypass, vps_fallback, vps_backup, enabled, redirect_url FROM domain_routing WHERE enabled = 1');
   // Kayıtlı olmayan VPS'e yönlenen kural (silinmiş VPS'in eski kaydı) ISP sayılır: "engelle" tablosu sahipsiz kalıcı
   // engele dönmesin.
   const vpsIds = (await dbAll('SELECT id FROM vps_servers') as any[]).map(r => Number(r.id));
   const known = new Set(vpsIds.map(String));
   const exitOf = (e: unknown) => { const x = String(e ?? 'isp'); return known.has(x) ? x : 'isp'; };
+  const backupOf = (rule: any) => routeBackup(rule.vps_backup, exitOf(rule.exit_node), known);
   // Yeniden açılan / yeni kurulan tünel "yanıt vermiyor" sayılmaz (izleyicinin sonraki ölçümünü beklemeden rota geri gelir).
   for (const t of (await readVpsTunnels(vpsIds).catch(() => new Map())).values()) {
     if (t.state === 'up' || t.state === 'connecting') setTunnelStale(t.vpsId, false);
   }
 
-  const allDomains: { domain: string; exit_node: string; dpi_bypass: number; enabled: number; redirect_url?: string; vps_fallback?: string }[] = [];
+  const allDomains: { domain: string; exit_node: string; dpi_bypass: number; enabled: number; redirect_url?: string; vps_fallback?: string; vps_backup?: string }[] = [];
   // IP aralığı girdileri (ipRanges.ts): @asn:<n>[!443] ve a.b.c.d[/nn] — DNS'siz trafik (ör. WhatsApp aramaları) için.
   const ranges: RangeRoute[] = [];
   // Hazır liste girdileri (categoryLists.ts): @list:adult / @list:gambling — işaretliyse (VPS çıkışı ya da yalnız DPI)
@@ -2062,29 +2088,29 @@ async function applyAllRoutingRulesNow() {
           void recordEventOnce('routing-list', `${rule.app_name} yönlendirilemedi: ${info?.error || 'hazır liste yüklenemedi'}`, 'warning', 60);
           continue;
         }
-        lists.push({ id, exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, vps_fallback: rule.vps_fallback });
+        lists.push({ id, exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, vps_fallback: rule.vps_fallback, vps_backup: backupOf(rule) });
         continue;
       }
       const asn = ASN_TOKEN.exec(domain);
       if (asn) {
         const r = await getAsnPrefixes(Number(asn[1]));
-        if (r.prefixes.length) ranges.push({ exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, prefixes: r.prefixes, excludeWeb: !!asn[2], vps_fallback: rule.vps_fallback });
+        if (r.prefixes.length) ranges.push({ exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, prefixes: r.prefixes, excludeWeb: !!asn[2], vps_fallback: rule.vps_fallback, vps_backup: backupOf(rule) });
         continue;
       }
       const cidr = normalizeCidr(domain);
       if (cidr) {
-        ranges.push({ exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, prefixes: [cidr], excludeWeb: false, vps_fallback: rule.vps_fallback });
+        ranges.push({ exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, prefixes: [cidr], excludeWeb: false, vps_fallback: rule.vps_fallback, vps_backup: backupOf(rule) });
         continue;
       }
       // dnsmasq ipset handles subdomains automatically, strip leading *.
       const clean = domain.replace(/^\*\./, '');
-      allDomains.push({ domain: clean, exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, enabled: 1, vps_fallback: rule.vps_fallback });
+      allDomains.push({ domain: clean, exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, enabled: 1, vps_fallback: rule.vps_fallback, vps_backup: backupOf(rule) });
     }
   }
 
   // Custom domain rules — redirect_url dahil (yoksa DNS-redirect kuralları kaybolur)
   for (const rule of domainRules) {
-    allDomains.push({ domain: rule.domain, exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, enabled: 1, redirect_url: rule.redirect_url || undefined, vps_fallback: rule.vps_fallback });
+    allDomains.push({ domain: rule.domain, exit_node: exitOf(rule.exit_node), dpi_bypass: rule.dpi_bypass, enabled: 1, redirect_url: rule.redirect_url || undefined, vps_fallback: rule.vps_fallback, vps_backup: backupOf(rule) });
   }
   // Zapret sayfasının ek DPI siteleri: ISP + DPI alan adı gibi işaretlenir (Zapret işarete bakar). Aynı alan adının
   // Routing kuralı varsa o geçerli (çıkışı ve DPI'ı kural belirler).
@@ -2093,6 +2119,13 @@ async function applyAllRoutingRulesNow() {
     const d = cleanDpiDomain(z.domain);
     if (d && !ruled.has(d)) allDomains.push({ domain: d, exit_node: 'isp', dpi_bypass: 1, enabled: 1 });
   }
+
+  // Yedek tünelli kuralların işaret yuvaları (routeSlots.ts) işaretler üretilmeden önce: yeni çifte yuva verilir. Olmazsa
+  // kural yedeksiz işaretle (son seçimiyle: engelle / operatör) uygulanır — routing durmaz.
+  const pairs = [...allDomains, ...ranges, ...lists]
+    .filter(r => r.exit_node !== 'isp' && !('redirect_url' in r && r.redirect_url) && tunnelFallback(normFallback(r.vps_fallback)))
+    .map(r => ({ primary: Number(r.exit_node), backup: normBackup(r.vps_backup) }));
+  await prepareRouteSlots(pairs).catch((e: any) => console.error('[routing] yedek tünel yuvaları hazırlanamadı:', e?.message || e));
 
   try {
     await applyDomainRouting(allDomains, ranges, { staleVps: staleTunnels(), lists });
@@ -2196,12 +2229,20 @@ async function bringUpTunnelsAndRouting() {
   await syncRelay().catch((e: any) => console.error('[uzaktan yönetim] uygulanamadı:', e.message));
 }
 
+// Kuralın tünel düşünce seçimi (routeMarks.VpsFallback) ve yedek tüneli ('' / 'auto' = çalışan ilk tünel, '7' = o VPS).
+const ROUTE_FALLBACKS = ['block', 'isp', 'tunnel', 'tunnel-isp'];
+function routeFallbackError(fallback: unknown, backup: unknown): string | null {
+  if (fallback !== undefined && !ROUTE_FALLBACKS.includes(String(fallback))) return `vps_fallback şunlardan biri olmalı: ${ROUTE_FALLBACKS.join(', ')}`;
+  if (backup !== undefined && !/^(auto|\d{1,4})?$/.test(String(backup))) return "vps_backup '', 'auto' ya da VPS numarası olmalı";
+  return null;
+}
+
 app.get('/api/routing/rules', async (_req, res) => {
   try {
     const rules = await dbAll(`
       SELECT t.id, t.app_name, t.category, t.route_type, t.vps_id, t.enabled,
              t.exit_node, t.dpi_bypass, t.domains, COALESCE(t.vps_fallback, 'block') AS vps_fallback,
-             s.ip as vps_ip, s.location as vps_location
+             COALESCE(t.vps_backup, '') AS vps_backup, s.ip as vps_ip, s.location as vps_location
       FROM traffic_routing t
       LEFT JOIN vps_servers s ON t.vps_id = s.id
       ORDER BY t.category, t.app_name
@@ -2217,10 +2258,9 @@ app.get('/api/routing/rules', async (_req, res) => {
 
 app.put('/api/routing/rules/:id', async (req, res) => {
   try {
-    const { route_type, vps_id, enabled, exit_node, dpi_bypass, vps_fallback } = req.body;
-    if (vps_fallback !== undefined && vps_fallback !== 'block' && vps_fallback !== 'isp') {
-      return res.status(400).json({ error: "vps_fallback 'block' ya da 'isp' olmalı" });
-    }
+    const { route_type, vps_id, enabled, exit_node, dpi_bypass, vps_fallback, vps_backup } = req.body;
+    const bad = routeFallbackError(vps_fallback, vps_backup);
+    if (bad) return res.status(400).json({ error: bad });
     const updates: string[] = [];
     const params: any[] = [];
     if (route_type !== undefined) { updates.push('route_type = ?'); params.push(route_type); }
@@ -2229,6 +2269,7 @@ app.put('/api/routing/rules/:id', async (req, res) => {
     if (exit_node !== undefined) { updates.push('exit_node = ?'); params.push(exit_node); }
     if (dpi_bypass !== undefined) { updates.push('dpi_bypass = ?'); params.push(dpi_bypass ? 1 : 0); }
     if (vps_fallback !== undefined) { updates.push('vps_fallback = ?'); params.push(vps_fallback); }
+    if (vps_backup !== undefined) { updates.push('vps_backup = ?'); params.push(String(vps_backup)); }
     if (updates.length === 0) return res.json({ success: true });
     params.push(req.params.id);
     await dbRun(`UPDATE traffic_routing SET ${updates.join(', ')} WHERE id = ?`, params);
@@ -2261,11 +2302,13 @@ app.get('/api/routing/domains', async (_req, res) => {
 
 app.post('/api/routing/domains', async (req, res) => {
   try {
-    const { domain, route_type, description, exit_node, dpi_bypass, redirect_url, vps_fallback } = req.body;
+    const { domain, route_type, description, exit_node, dpi_bypass, redirect_url, vps_fallback, vps_backup } = req.body;
     if (!domain) return res.status(400).json({ error: 'Domain gerekli' });
     const cleanDomain = domain.trim().toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, '').replace(/\/.*$/, '');
-    await dbRun('INSERT INTO domain_routing (domain, route_type, description, exit_node, dpi_bypass, redirect_url, vps_fallback) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [cleanDomain, route_type || 'direct', description || '', exit_node || 'isp', dpi_bypass ? 1 : 0, redirect_url || '', normFallback(vps_fallback)]);
+    // Eklemede geçersiz seçim reddedilmez, eskisi gibi varsayılana döner (engelle / otomatik yedek)
+    await dbRun('INSERT INTO domain_routing (domain, route_type, description, exit_node, dpi_bypass, redirect_url, vps_fallback, vps_backup) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [cleanDomain, route_type || 'direct', description || '', exit_node || 'isp', dpi_bypass ? 1 : 0, redirect_url || '', normFallback(vps_fallback),
+        routeFallbackError(undefined, vps_backup) ? '' : String(vps_backup ?? '')]);
     // Apply unified routing (app + domain rules together)
     await applyAllRoutingRules();
     if (dpi_bypass && !redirect_url) await autoStartZapret();
@@ -2281,10 +2324,9 @@ app.post('/api/routing/domains', async (req, res) => {
 
 app.put('/api/routing/domains/:id', async (req, res) => {
   try {
-    const { route_type, enabled, description, exit_node, dpi_bypass, redirect_url, vps_fallback } = req.body;
-    if (vps_fallback !== undefined && vps_fallback !== 'block' && vps_fallback !== 'isp') {
-      return res.status(400).json({ error: "vps_fallback 'block' ya da 'isp' olmalı" });
-    }
+    const { route_type, enabled, description, exit_node, dpi_bypass, redirect_url, vps_fallback, vps_backup } = req.body;
+    const bad = routeFallbackError(vps_fallback, vps_backup);
+    if (bad) return res.status(400).json({ error: bad });
     const updates: string[] = [];
     const params: any[] = [];
     if (route_type !== undefined) { updates.push('route_type = ?'); params.push(route_type); }
@@ -2294,6 +2336,7 @@ app.put('/api/routing/domains/:id', async (req, res) => {
     if (dpi_bypass !== undefined) { updates.push('dpi_bypass = ?'); params.push(dpi_bypass ? 1 : 0); }
     if (redirect_url !== undefined) { updates.push('redirect_url = ?'); params.push(redirect_url); }
     if (vps_fallback !== undefined) { updates.push('vps_fallback = ?'); params.push(vps_fallback); }
+    if (vps_backup !== undefined) { updates.push('vps_backup = ?'); params.push(String(vps_backup)); }
     if (updates.length === 0) return res.json({ success: true });
     params.push(req.params.id);
     await dbRun(`UPDATE domain_routing SET ${updates.join(', ')} WHERE id = ?`, params);
@@ -2320,7 +2363,7 @@ app.delete('/api/routing/domains/:id', async (req, res) => {
 
 // ─── Routing önerileri: yönlendirilen siteyle birlikte açılan alan adları (öner → tek tıkla ekle / yoksay) ───
 // /api/routing/domains/... altında DEĞİL: PUT/DELETE /:id rotaları o yolu yakalar.
-const DOMAIN_ROUTING_COLUMNS = "id, domain, route_type, description, enabled, exit_node, dpi_bypass, redirect_url, COALESCE(vps_fallback, 'block') AS vps_fallback, created_at";
+const DOMAIN_ROUTING_COLUMNS = "id, domain, route_type, description, enabled, exit_node, dpi_bypass, redirect_url, COALESCE(vps_fallback, 'block') AS vps_fallback, COALESCE(vps_backup, '') AS vps_backup, created_at";
 // Öneri adları sunucunun ürettiği hedeflerdir: yalnız kırpılır/küçültülür. POST /api/routing/domains'teki gibi 'www.'
 // SİLİNMEZ — tek görülen 'www.x.com' önerisi 'x.com' (tüm alt adresler) olarak kaydedilirse onaylanandan geniş olurdu.
 const cleanSuggestedDomain = (d: unknown) => (typeof d === 'string' ? d.trim().toLowerCase() : '');
@@ -2357,7 +2400,7 @@ app.post('/api/routing/suggestions/accept', async (req, res) => {
     if (!Number.isInteger(ruleId) || !Array.isArray(list) || list.length < 1 || list.length > 20) {
       return res.status(400).json({ error: 'Geçersiz istek' });
     }
-    const parent = await dbGet('SELECT id, domain, exit_node, dpi_bypass, redirect_url, parent_id, vps_fallback FROM domain_routing WHERE id = ?', [ruleId]);
+    const parent = await dbGet('SELECT id, domain, exit_node, dpi_bypass, redirect_url, parent_id, vps_fallback, vps_backup FROM domain_routing WHERE id = ?', [ruleId]);
     if (!parent) return res.status(404).json({ error: 'Kural bulunamadı' });
     if (parent.redirect_url || ((parent.exit_node || 'isp') === 'isp' && !parent.dpi_bypass)) {
       return res.status(400).json({ error: 'Bu kural özel bir çıkış kullanmıyor' });
@@ -2370,9 +2413,9 @@ app.post('/api/routing/suggestions/accept', async (req, res) => {
     for (const d of clean) {
       // Düz INSERT: eşzamanlı iki istekte ikincisi UNIQUE hatasıyla 'zaten ekli'ye düşer (yanlışlıkla 'eklendi' sayılmaz).
       try {
-        await dbRun(`INSERT INTO domain_routing (domain, route_type, description, exit_node, dpi_bypass, redirect_url, parent_id, vps_fallback)
-          VALUES (?, 'direct', ?, ?, ?, '', ?, ?)`,
-          [d, `Öneri: ${parent.domain}`, parent.exit_node || 'isp', parent.dpi_bypass ? 1 : 0, parent.parent_id ?? parent.id, normFallback(parent.vps_fallback)]);
+        await dbRun(`INSERT INTO domain_routing (domain, route_type, description, exit_node, dpi_bypass, redirect_url, parent_id, vps_fallback, vps_backup)
+          VALUES (?, 'direct', ?, ?, ?, '', ?, ?, ?)`,
+          [d, `Öneri: ${parent.domain}`, parent.exit_node || 'isp', parent.dpi_bypass ? 1 : 0, parent.parent_id ?? parent.id, normFallback(parent.vps_fallback), String(parent.vps_backup ?? '')]);
         added.push(d);
       } catch (e: any) {
         if (!String(e?.message).includes('UNIQUE')) throw e;
@@ -3266,6 +3309,7 @@ if (isLinux) {
 if (isLinux) {
   const staleTicks = new Map<number, number>();
   let routesDirty = false; // rota senkronu başarısız olduysa sonraki turda yeniden denenir
+  let lastUsable: string | null = null; // kullanılabilir tüneller (arayüz var + yanıt vermiyor onaylanmamış), "1,3"
   let lastWatchError = ''; // aynı hata her 30 sn'de günlüğe yazılmasın
   let lastRelayError = '';
   const lastTunnelAlert = (source: string) =>
@@ -3285,7 +3329,8 @@ if (isLinux) {
           const n = (staleTicks.get(t.vpsId) || 0) + 1;
           staleTicks.set(t.vpsId, n);
           if (n < 2) continue;
-          // Onaylandı: tünel rotası bu VPS'in tablolarından çıkar (engelle → hemen hata, operatörden devam → ISP).
+          // Onaylandı: tünel rotası bu VPS'in tablolarından çıkar (yedek tünelli kural → çalışan yedek; yoksa / yedeksiz:
+          // engelle → hemen hata, operatörden devam → ISP).
           if (setTunnelStale(t.vpsId, true)) changed = true;
           const last = await lastTunnelAlert(src);
           if (last && last.severity === 'warning') continue;
@@ -3305,6 +3350,12 @@ if (isLinux) {
             [`VPS tüneli yeniden yanıt veriyor: ${label} — yönlendirilen trafik yeniden tünelden`, src]);
         }
       }
+      // Kullanılabilir tüneller değişince de (arayüz kalktı / geldi): yedek tünelli kurallar çalışan tünele geçer ya da ana
+      // tünele döner, yeniden gelen arayüzün tablo rotası geri yazılır (syncMarkTable).
+      const usable = [...tunnels.values()].filter(t => t.state !== 'down' && !staleTunnels().has(t.vpsId))
+        .map(t => t.vpsId).sort((a, b) => a - b).join(',');
+      if (usable !== lastUsable) changed = true;
+      lastUsable = usable;
       if (changed || routesDirty) {
         routesDirty = true;
         await runInRoutingQueue(() => syncVpsRoutes(staleTunnels()));

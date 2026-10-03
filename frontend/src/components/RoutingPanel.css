@@ -80,7 +80,8 @@
 .rt-icon { grid-area: icon; display: flex; align-items: center; justify-content: center; }
 .rt-name { grid-area: name; }
 .rt-exit { grid-area: exit; min-width: 0; }
-.rt-fb { grid-area: fb; min-width: 0; }
+.rt-fb { grid-area: fb; min-width: 0; display: grid; gap: 6px; }
+.rt-fb-note { color: var(--text-muted); font-size: 11.5px; line-height: 1.45; }
 .rt-dpi { grid-area: dpi; display: flex; justify-content: flex-end; }
 .rt-state { grid-area: state; display: flex; justify-content: flex-end; }
 .rt-del { grid-area: del; display: flex; justify-content: center; }

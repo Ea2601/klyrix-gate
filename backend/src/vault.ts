@@ -930,7 +930,8 @@ export function vpsRuleWarning(data: Record<string, unknown>, vpsHere: number[])
   for (const r of vpsRules(data)) {
     if (vpsHere.includes(r.id)) continue;
     ids.add(r.id);
-    (r.fallback === 'isp' ? out.isp : out.block).push(r.name);
+    // 'tunnel-isp' (başka tünelden, yoksa operatörden) operatör listesine; 'tunnel' (yoksa engelle) engel listesine
+    (r.fallback === 'isp' || r.fallback === 'tunnel-isp' ? out.isp : out.block).push(r.name);
   }
   return { ids: [...ids].sort((a, b) => a - b), ...out };
 }

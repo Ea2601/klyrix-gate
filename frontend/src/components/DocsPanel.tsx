@@ -617,6 +617,12 @@ function RoutingDoc() {
         <p><strong>Pi-hole:</strong> Tüm trafik Pi-hole üzerinden geçer — ayrıca açıp kapatmaya gerek yoktur.</p>
         <p><strong>Çıkış noktası:</strong> Her kural veya cihaz için bağımsız olarak ISP veya herhangi bir VPS sunucusu seçilebilir.</p>
         <p><strong>DPI Bypass:</strong> Çıkış noktasından bağımsız olarak etkinleştirilebilir. ISP ile kullanıldığında direkt bağlantıda DPI atlatma, VPS ile kullanıldığında tünel üzerinde DPI atlatma sağlar.</p>
+        <p><strong>Tünel düşerse:</strong> VPS çıkışlı her kuralda ayrı seçilir — <em>engelle</em> (trafik operatöre sızmaz),{' '}
+          <em>operatörden devam</em>, ya da <em>yedek → engelle</em> / <em>yedek → operatör</em>: trafik yedek VPS tüneline geçer
+          (otomatik: Pi'de çalışan ilk tünel, numara sırasıyla; ya da seçtiğiniz VPS), ana tünel geri gelince kendiliğinden ona döner.
+          Yedek de yoksa seçime göre engellenir ya da operatörden devam eder. Tünel arayüzü kalkınca 30 sn içinde, VPS yanıt vermeyince el sıkışma eskiyip iki ölçümle
+          onaylandığında (birkaç dakika) geçilir. Otomatik yedek yalnız interneti taşıyan tünelleri kullanır: içe aktarılan bölünmüş
+          tünel (ör. yalnız şirket ağı) seçilmez.</p>
       </DocBlock>
     </div>
   );

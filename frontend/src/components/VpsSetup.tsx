@@ -95,14 +95,15 @@ function StepIndicator({ step }: { step: SetupStep }) {
   );
 }
 
-// Bu VPS'e yönlenen etkin kurallar, tünel düşünce ne olacağına göre (Kes / Sil onayı). Okunamazsa boş: onay sorulmaz,
-// işlem eskisi gibi sürer.
-async function vpsRuleUsage(id: number): Promise<{ block: string[]; isp: string[] }> {
+// Bu VPS'e yönlenen etkin kurallar, tünel düşünce ne olacağına göre (Kes / Sil onayı): yedek tünele geçecek (şu an çalışan
+// yedeği olan), engellenecek, operatörden devam edecek. Okunamazsa boş: onay sorulmaz, işlem eskisi gibi sürer.
+type RuleUsage = { block: string[]; isp: string[]; tunnel: string[] };
+async function vpsRuleUsage(id: number): Promise<RuleUsage> {
   try {
-    const r = await getApi<{ block?: string[]; isp?: string[] }>(`/vps/${id}/routing-usage`);
-    return { block: r.block || [], isp: r.isp || [] };
+    const r = await getApi<{ block?: string[]; isp?: string[]; tunnel?: string[] }>(`/vps/${id}/routing-usage`);
+    return { block: r.block || [], isp: r.isp || [], tunnel: r.tunnel || [] };
   } catch {
-    return { block: [], isp: [] };
+    return { block: [], isp: [], tunnel: [] };
   }
 }
 const ruleNames = (xs: string[]) => xs.slice(0, 6).join(', ') + (xs.length > 6 ? ` +${xs.length - 6}` : '');
@@ -535,7 +536,7 @@ function VpsCard({ server, onConnect, onDisconnect, onDelete, onRefresh, tunnelN
   const [rate, setRate] = useState<{ down: number; up: number } | null>(null);
   const [tunnelPoll, setTunnelPoll] = useState(0);
   const lastRead = useRef<TunnelStatus | null>(null);
-  const [usage, setUsage] = useState<{ block: string[]; isp: string[] } | null>(null);
+  const [usage, setUsage] = useState<RuleUsage | null>(null);
   const [busy, setBusy] = useState<'connect' | 'disconnect' | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const refreshTunnel = () => setTunnelPoll(k => k + 1);
@@ -679,7 +680,7 @@ function VpsCard({ server, onConnect, onDisconnect, onDelete, onRefresh, tunnelN
   const allGood = !!ns && CHECKS.every(c => ns[c.key]);
   const vpsTone: Tone = server.status === 'connected' ? 'ok' : server.status === 'installing' ? 'info' : server.status === 'error' ? 'bad' : 'off';
   const vpsText = server.status === 'connected' ? 'Bağlı' : server.status === 'installing' ? 'Kuruluyor' : server.status === 'error' ? 'Hata' : 'Bağlı değil';
-  const nRules = usage ? usage.block.length + usage.isp.length : 0;
+  const nRules = usage ? usage.block.length + usage.isp.length + usage.tunnel.length : 0;
   const title = server.location?.trim() || server.ip;
 
   return (
@@ -748,8 +749,12 @@ function VpsCard({ server, onConnect, onDisconnect, onDelete, onRefresh, tunnelN
         </div>
         </>
         )}
-        <InfoRow label="Kurallar" title={usage && nRules ? [...usage.block, ...usage.isp].join(', ') : undefined}
-          sub={usage && nRules ? `tünel düşerse ${usage.block.length} engellenir${usage.isp.length ? `, ${usage.isp.length} operatörden` : ''}` : ''}>
+        <InfoRow label="Kurallar" title={usage && nRules ? [...usage.tunnel, ...usage.block, ...usage.isp].join(', ') : undefined}
+          sub={usage && nRules ? `tünel düşerse ${[
+            ...(usage.tunnel.length ? [`${usage.tunnel.length} yedek tünele geçer`] : []),
+            ...(usage.block.length ? [`${usage.block.length} engellenir`] : []),
+            ...(usage.isp.length ? [`${usage.isp.length} operatörden`] : []),
+          ].join(', ')}` : ''}>
           {!usage ? <span className="wg-sub">okunuyor…</span> : nRules ? <span>{nRules} kural bu VPS'ten çıkıyor</span>
             : <span className="wg-sub">yönlendirilen kural yok</span>}
         </InfoRow>
@@ -993,7 +998,7 @@ export function VpsSetup() {
     if ((data.servers.find(s => s.id === id)?.panel_access || 0) > 0
       && !confirmTunnelCut("VPS'i silmek bu bağlantıyı keser; uzaktan yönetim ancak ev ağından yeniden kurulur.")) return;
     const u = await vpsRuleUsage(id);
-    const all = [...u.block, ...u.isp];
+    const all = [...u.tunnel, ...u.block, ...u.isp];
     const nClients = await getApi<{ clients?: unknown[] }>(`/vps/${id}/clients`).then(r => r.clients?.length || 0, () => 0);
     const lines = [
       ...(all.length ? [`Bu VPS'e yönlenen ${all.length} kural operatöre (ISP) çevrilecek: ${ruleNames(all)}`] : []),
@@ -1137,8 +1142,9 @@ export function VpsSetup() {
                       )) return;
                       // Tünel kesilince "engelle" kuralları açılmaz (trafik operatöre sızmaz) — kural varsa önce sorulur.
                       const u = await vpsRuleUsage(server.id);
-                      if (u.block.length || u.isp.length) {
+                      if (u.block.length || u.isp.length || u.tunnel.length) {
                         const lines = [
+                          ...(u.tunnel.length ? [`Yedek tünelden devam edecek (${u.tunnel.length}): ${ruleNames(u.tunnel)}`] : []),
                           ...(u.block.length ? [`Engellenecek (${u.block.length}): ${ruleNames(u.block)} — tünel kapalıyken bu siteler açılmaz.`] : []),
                           ...(u.isp.length ? [`Operatörden devam edecek (${u.isp.length}): ${ruleNames(u.isp)}`] : []),
                         ];

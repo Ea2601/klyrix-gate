@@ -57,6 +57,9 @@ export interface VpsImportInfo {
   mtu: number | null;
 }
 
+// Kural başına, VPS tüneli düşünce (backend routeMarks.ts)
+export type VpsFallback = 'block' | 'isp' | 'tunnel' | 'tunnel-isp';
+
 export interface TrafficRule {
   id: number;
   app_name: string;
@@ -64,8 +67,10 @@ export interface TrafficRule {
   route_type: string;
   exit_node: string;
   dpi_bypass: number;
-  // VPS çıkışında tünel düşerse: engelle (varsayılan) ya da operatörden devam.
-  vps_fallback?: 'block' | 'isp';
+  // VPS çıkışında tünel düşerse: engelle (varsayılan), operatörden devam ya da başka tünelden (yoksa engelle / operatörden).
+  vps_fallback?: VpsFallback;
+  // Yedek tünel ('tunnel*'): '' / 'auto' = çalışan ilk tünel, '7' = o VPS
+  vps_backup?: string;
   domains: string;
   vps_id: number | null;
   vps_ip: string | null;

@@ -77,6 +77,18 @@ export function dbTimeMs(s: unknown): number {
   return Date.parse(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(t) ? `${t.replace(' ', 'T')}Z` : t);
 }
 
+// Yönlendirme kuralının yedek tüneli (vps_backup: '' / 'auto' = çalışan ilk tünel, '7' = o VPS; routeMarks.normBackup).
+// Sütun ilk kez eklenirken bir kez: "tünel düşerse operatörden devam" ('isp') kuralları "başka tünelden, yoksa operatörden"
+// ('tunnel-isp', otomatik yedek) olur — kullanıcı kararı (2026-10-03): tünel düşünce önce çalışan diğer tüneller kullanılsın.
+function addBackupColumn(table: 'traffic_routing' | 'domain_routing') {
+  db.run(`ALTER TABLE ${table} ADD COLUMN vps_backup TEXT DEFAULT ''`, (err: Error | null) => {
+    if (err) return; // sütun zaten var
+    db.run(`UPDATE ${table} SET vps_fallback = 'tunnel-isp', vps_backup = 'auto' WHERE vps_fallback = 'isp'`, function (this: any, e: Error | null) {
+      if (!e && this?.changes) console.log(`[routing] ${this.changes} kural (${table}) tünel düşünce önce başka tünele geçecek şekilde taşındı`);
+    });
+  });
+}
+
 export const initDb = () => {
   db.serialize(() => {
 
@@ -122,8 +134,10 @@ export const initDb = () => {
     db.run(`ALTER TABLE traffic_routing ADD COLUMN exit_node TEXT DEFAULT 'isp'`, () => {});
     db.run(`ALTER TABLE traffic_routing ADD COLUMN dpi_bypass INTEGER DEFAULT 0`, () => {});
     db.run(`ALTER TABLE traffic_routing ADD COLUMN domains TEXT DEFAULT ''`, () => {});
-    // VPS çıkışlı kuralda tünel düşünce: 'block' (engelle — trafik operatöre sızmaz) | 'isp' (operatörden devam).
+    // VPS çıkışlı kuralda tünel düşünce: 'block' (engelle — trafik operatöre sızmaz) | 'isp' (operatörden devam) |
+    // 'tunnel' / 'tunnel-isp' (yedek tünelden — vps_backup; o da yoksa engelle / operatörden).
     db.run(`ALTER TABLE traffic_routing ADD COLUMN vps_fallback TEXT DEFAULT 'block'`, () => {});
+    addBackupColumn('traffic_routing');
 
     // Default app routing rules with known domains
     const trafficRules: [number, string, string, string, string][] = [
@@ -266,6 +280,7 @@ export const initDb = () => {
     db.run(`ALTER TABLE domain_routing ADD COLUMN dpi_bypass INTEGER DEFAULT 0`, () => {});
     db.run(`ALTER TABLE domain_routing ADD COLUMN redirect_url TEXT DEFAULT ''`, () => {});
     db.run(`ALTER TABLE domain_routing ADD COLUMN vps_fallback TEXT DEFAULT 'block'`, () => {});
+    addBackupColumn('domain_routing');
     // Routing önerisinden eklenen kuralın kaynak kuralı: bu kurallar kendileri öneri üretmez (siteler arası zincir olmasın).
     db.run(`ALTER TABLE domain_routing ADD COLUMN parent_id INTEGER DEFAULT NULL`, () => {});
     // Yoksayılan öneriler (kayıtlı alan adı; global — hiçbir kural için yeniden önerilmez)
